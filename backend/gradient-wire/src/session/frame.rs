@@ -63,6 +63,8 @@ const WRITE_BATCH: usize = 32;
 
 const BULK_BATCH_BYTES: usize = 256 * 1024;
 
+const KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(30);
+
 pub trait WireMessage: Proto + std::fmt::Debug + Send + 'static {
     fn variant_name(&self) -> &'static str;
 
@@ -735,8 +737,21 @@ async fn axum_writer_task(
     mut sink: futures::stream::SplitSink<WebSocket, AxumMessage>,
 ) {
     let mut batch = Vec::with_capacity(WRITE_BATCH);
+    let mut keepalive = tokio::time::interval(KEEPALIVE_PING_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await;
     loop {
-        if !lanes.next_batch(&mut batch).await {
+        let more = tokio::select! {
+            more = lanes.next_batch(&mut batch) => more,
+            _ = keepalive.tick() => {
+                if let Err(e) = sink.send(AxumMessage::Ping(Bytes::new())).await {
+                    debug!(error = %e, "axum WS writer task: keepalive ping failed; exiting");
+                    return;
+                }
+                continue;
+            }
+        };
+        if !more {
             break;
         }
         for bytes in batch.drain(..) {
@@ -749,6 +764,7 @@ async fn axum_writer_task(
             debug!(error = %e, "axum WS writer task: flush failed; exiting");
             return;
         }
+        keepalive.reset();
     }
 }
 
@@ -760,8 +776,21 @@ async fn tungstenite_writer_task(
     >,
 ) {
     let mut batch = Vec::with_capacity(WRITE_BATCH);
+    let mut keepalive = tokio::time::interval(KEEPALIVE_PING_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await;
     loop {
-        if !lanes.next_batch(&mut batch).await {
+        let more = tokio::select! {
+            more = lanes.next_batch(&mut batch) => more,
+            _ = keepalive.tick() => {
+                if let Err(e) = sink.send(TungsteniteMessage::Ping(Bytes::new())).await {
+                    debug!(error = %e, "tungstenite WS writer task: keepalive ping failed; exiting");
+                    return;
+                }
+                continue;
+            }
+        };
+        if !more {
             break;
         }
         for bytes in batch.drain(..) {
@@ -774,6 +803,7 @@ async fn tungstenite_writer_task(
             debug!(error = %e, "tungstenite WS writer task: flush failed; exiting");
             return;
         }
+        keepalive.reset();
     }
 }
 
@@ -1032,6 +1062,40 @@ mod tests {
         let mut batch = Vec::new();
         assert!(!lanes.next_batch(&mut batch).await);
         assert!(batch.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_writer_is_pinging_so_a_proxy_keeps_the_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (client, server) = tokio::join!(
+            tokio_tungstenite::connect_async(format!("ws://{addr}")),
+            async {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio_tungstenite::accept_async(stream).await.unwrap()
+            }
+        );
+        let (ws, _) = client.unwrap();
+        let mut server = server;
+
+        // The lane senders stay open: the writer is idle, not done.
+        let (_bulk_tx, bulk_rx) = mpsc::channel::<Bytes>(WRITER_QUEUE_DEPTH);
+        let (_prio_tx, prio_rx) = mpsc::channel::<Bytes>(WRITER_QUEUE_DEPTH);
+        let (sink, _client_read) = ws.split();
+        let writer = tungstenite_writer_task(WriterLanes::new(prio_rx, bulk_rx), sink);
+
+        let frame = tokio::select! {
+            frame = tokio::time::timeout(KEEPALIVE_PING_INTERVAL * 2, server.next()) => frame,
+            () = writer => panic!("the writer must stay up while its lanes are open"),
+        }
+        .expect("an idle writer must ping within the keepalive interval")
+        .expect("the socket must stay open")
+        .unwrap();
+        assert!(
+            matches!(frame, TungsteniteMessage::Ping(_)),
+            "unexpected frame: {frame:?}"
+        );
     }
 
     #[test]
